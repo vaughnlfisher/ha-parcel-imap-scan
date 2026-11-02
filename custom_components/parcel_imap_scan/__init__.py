@@ -12,6 +12,7 @@ from __future__ import annotations
 import email
 import imaplib
 import logging
+import re
 from datetime import datetime, timedelta
 from email.header import decode_header
 from email.message import Message
@@ -65,21 +66,63 @@ def _decode_header_value(value: str | None) -> str:
     return decoded
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_WS_RE = re.compile(r"[ \t]+")
+
+
+def _html_to_text(html: str) -> str:
+    """Crude HTML-to-text fallback: surface href URLs and strip tags.
+
+    Many retail/shipping emails (Amazon, AliExpress, and others) are HTML-only
+    or have a near-empty plain-text alternative, with the actual tracking
+    number only present as link text or inside an href query string (e.g.
+    "...tracking.../TBA123456789012" or "...?trackingNumber=1Z...."). Keeping
+    href targets in the extracted text lets the existing regexes in
+    extract.py still find those numbers.
+    """
+    if not html:
+        return ""
+    hrefs = " ".join(_HREF_RE.findall(html))
+    # Drop script/style blocks entirely so their content never leaks into the haystack.
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = _TAG_RE.sub(" ", html)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = _WS_RE.sub(" ", text)
+    return f"{text}\n{hrefs}"
+
+
 def _extract_body(msg: Message) -> str:
     if msg.is_multipart():
-        body = ""
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
         for part in msg.walk():
-            if part.get_content_type() == "text/plain" and not part.get_filename():
-                payload = part.get_payload(decode=True)
-                if payload:
-                    body += payload.decode(
-                        part.get_content_charset() or "utf-8", errors="replace"
-                    )
-        return body
+            if part.get_filename():
+                continue
+            content_type = part.get_content_type()
+            if content_type not in ("text/plain", "text/html"):
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            decoded = payload.decode(
+                part.get_content_charset() or "utf-8", errors="replace"
+            )
+            if content_type == "text/plain":
+                plain_parts.append(decoded)
+            else:
+                html_parts.append(_html_to_text(decoded))
+        # Always include both: a sparse plain-text alternative (common in
+        # marketing-styled shipping emails) means the tracking number may
+        # only be recoverable from the HTML part's link text/hrefs.
+        return "\n".join(plain_parts + html_parts)
     payload = msg.get_payload(decode=True)
     if not payload:
         return ""
-    return payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+    decoded = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+    if msg.get_content_type() == "text/html":
+        return _html_to_text(decoded)
+    return decoded
 
 
 def _scan_mailbox(
